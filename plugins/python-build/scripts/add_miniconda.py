@@ -108,6 +108,8 @@ class PyVersion(StrEnum):
     PY37 = "py37"
     PY38 = "py38"
     PY39 = "py39"
+    PY310 = "py310"
+    PY311 = "py311"
 
     def version(self):
         first, *others = self.value[2:]
@@ -120,7 +122,7 @@ class PyVersion(StrEnum):
 @total_ordering
 class VersionStr(str):
     def info(self):
-        return tuple(int(n) for n in self.split("."))
+        return tuple(int(n) for n in self.replace("-", ".").split("."))
 
     def __eq__(self, other):
         return str(self) == str(other)
@@ -149,20 +151,23 @@ class CondaVersion(NamedTuple):
         """
         Convert a string of the form "miniconda_n-ver" or "miniconda_n-py_ver-ver" to a :class:`CondaVersion` object.
         """
-        components = s.split("-")
-        if len(components) == 3:
-            miniconda_n, py_ver, ver = components
-            py_ver = PyVersion(f"py{py_ver.replace('.', '')}")
-        else:
-            miniconda_n, ver = components
-            py_ver = None
-
+        miniconda_n, _, remainder = s.partition("-")
         suffix = miniconda_n[-1]
         if suffix in string.digits:
             flavor = miniconda_n[:-1]
         else:
             flavor = miniconda_n
             suffix = ""
+
+        components = remainder.split("-")
+        if flavor == Flavor.MINICONDA and len(components) >= 2:
+            py_ver, *ver_parts = components
+            py_ver = PyVersion(f"py{py_ver.replace('.', '')}")
+            ver = "-".join(ver_parts)
+        else:
+            ver = "-".join(components)
+            py_ver = None
+
         return CondaVersion(Flavor(flavor), Suffix(suffix), VersionStr(ver), py_ver)
 
     def to_filename(self):
@@ -188,7 +193,11 @@ class CondaVersion(NamedTuple):
             else:
                 return PyVersion.PY37
         if self.flavor == "anaconda":
-            # https://docs.anaconda.com/anaconda/reference/release-notes/
+            # https://docs.anaconda.com/free/anaconda/reference/release-notes/
+            if v >= (2023,7):
+                return PyVersion.PY311
+            if v >= (2023,3):
+                return PyVersion.PY310
             if v >= (2021,11):
                 return PyVersion.PY39
             if v >= (2020,7):
@@ -199,7 +208,7 @@ class CondaVersion(NamedTuple):
                 return PyVersion.PY37
             return PyVersion.PY36
 
-        raise ValueError(flavor)
+        raise ValueError(self.flavor)
 
 
 class CondaSpec(NamedTuple):
@@ -213,7 +222,10 @@ class CondaSpec(NamedTuple):
 
     @classmethod
     def from_filestem(cls, stem, md5, repo, py_version=None):
-        miniconda_n, ver, os, arch = stem.split("-")
+        # The `*vers` captures the new trailing `-1` in some file names (a build number?)
+        # so they can be processed properly.
+        miniconda_n, *vers, os, arch = stem.split("-")
+        ver = "-".join(vers)
         suffix = miniconda_n[-1]
         if suffix in string.digits:
             tflavor = miniconda_n[:-1]
@@ -285,7 +297,7 @@ def get_existing_condas(name):
                 logger.debug("Found existing %(name)s version %(v)s", locals())
                 yield v
         except ValueError:
-            pass
+            logger.error("Unable to parse existing version %s", entry_name)
 
 
 def get_available_condas(name, repo):
@@ -371,7 +383,7 @@ if __name__ == "__main__":
             reason = "already exists"
         elif key.version_str.info() <= (4, 3, 30):
             reason = "too old"
-        elif len(key.version_str.info()) >= 4:
+        elif len(key.version_str.info()) >= 4 and "-" not in key.version_str:
             reason = "ignoring hotfix releases"
         
         if reason:

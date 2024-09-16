@@ -19,7 +19,11 @@ PYTHON_BUILD_VERSION="20180424"
 OLDIFS="$IFS"
 
 set -E
-[ -n "$PYENV_DEBUG" ] && set -x
+shopt -s extglob
+[ -n "$PYENV_DEBUG" ] && {
+  export PS4='+(${BASH_SOURCE}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+  set -x
+}
 
 exec 3<&2 # preserve original stderr at fd 3
 
@@ -56,9 +60,14 @@ lib() {
 }
 lib "$1"
 
+READLINK=$(type -P readlink)
+if [ -z "$READLINK" ]; then
+  echo "pyenv: cannot find readlink - are you missing GNU coreutils?" >&2
+  exit 1
+fi
 
 resolve_link() {
-  $(type -P greadlink readlink | head -1) "$1"
+  $READLINK "$1"
 }
 
 abs_dirname() {
@@ -102,7 +111,7 @@ os_information() {
     source /etc/os-release
     echo "$NAME" $VERSION_ID
   else
-    local os="$(cat /etc/{centos,redhat,fedora,system}-release /etc/debian_version 2>/dev/null | head -1)"
+    local os="$(cat /etc/{centos,redhat,fedora,system}-release /etc/debian_version 2>/dev/null | head -n1)"
     echo "${os:-$(uname -sr)}"
   fi
 }
@@ -113,8 +122,17 @@ is_mac() {
 }
 
 can_use_homebrew() {
-    [ -z "$PYTHON_BUILD_SKIP_HOMEBREW" ] || return 1
-    is_mac || return 1
+  [[ -n "$PYTHON_BUILD_USE_HOMEBREW" && -n "$PYTHON_BUILD_SKIP_HOMEBREW" ]] && {
+    echo "error: mutually exclusive environment variables PYTHON_BUILD_USE_HOMEBREW and PYTHON_BUILD_SKIP_HOMEBREW are set" >&3
+    exit 1
+  }
+  [[ -n "$PYTHON_BUILD_USE_HOMEBREW" ]] && return 0
+  [[ -n "$PYTHON_BUILD_SKIP_HOMEBREW" ]] && return 1
+  is_mac && return 0
+  # In Linux, if Pyenv itself is installed with Homebrew,
+  # we assume the user wants to take dependencies from there as well by default
+  command -v brew &>/dev/null && [[ $(abs_dirname "${BASH_SOURCE}") == "$(abs_dirname "$(brew --prefix 2>/dev/null ||true)")"/* ]] && return 0
+  return 1
 }
 
 #  9.1  -> 901
@@ -233,9 +251,7 @@ install_package_using() {
   make_package "${make_args[@]}"
   popd >&4
 
-  { echo "Installed ${package_name} to ${PREFIX_PATH}"
-    echo
-  } >&2
+  echo "Installed ${package_name} to ${PREFIX_PATH}" >&2
 }
 
 make_package() {
@@ -258,7 +274,7 @@ compute_sha2() {
     output="$(shasum -a 256 -b)" || return 1
     echo "${output% *}"
   elif type openssl &>/dev/null; then
-    local openssl="$(command -v "$(brew --prefix openssl 2>/dev/null || true)"/bin/openssl openssl | head -1)"
+    local openssl="$(command -v "$(brew --prefix openssl 2>/dev/null || true)"/bin/openssl openssl | head -n1)"
     output="$("$openssl" dgst -sha256 2>/dev/null)" || return 1
     echo "${output##* }"
   elif type sha256sum &>/dev/null; then
@@ -382,7 +398,7 @@ http_get_aria2c() {
   fi
 
   if aria2c --allow-overwrite=true --no-conf=true -d "${dir_out}" -o "${out}" ${ARIA2_OPTS} "$1" >&4; then
-    [ -n "$2" ] || cat "${out}"
+    [ -n "$2" ] || cat "${dir_out:-.}/${out}"
   else
     false
   fi
@@ -800,12 +816,14 @@ build_package_standard_build() {
     use_homebrew || true
     use_tcltk || true
     use_homebrew_readline || use_freebsd_pkg || true
+    use_homebrew_ncurses || true
     if is_mac -ge 1014; then
       use_xcode_sdk_zlib || use_homebrew_zlib || true
     else
       use_homebrew_zlib || true
     fi
     use_dsymutil || true
+    use_free_threading || true
   fi
 
   ( if [ "${CFLAGS+defined}" ] || [ "${!PACKAGE_CFLAGS+defined}" ]; then
@@ -815,10 +833,10 @@ build_package_standard_build() {
       export CC=clang
     fi
     ${!PACKAGE_CONFIGURE:-./configure} --prefix="${!PACKAGE_PREFIX_PATH:-$PREFIX_PATH}" \
-      $CONFIGURE_OPTS ${!PACKAGE_CONFIGURE_OPTS} "${!PACKAGE_CONFIGURE_OPTS_ARRAY}" || return 1
+      "${!PACKAGE_CONFIGURE_OPTS_ARRAY}" $CONFIGURE_OPTS ${!PACKAGE_CONFIGURE_OPTS} || return 1
   ) >&4 2>&1
 
-  { "$MAKE" $MAKE_OPTS ${!PACKAGE_MAKE_OPTS} "${!PACKAGE_MAKE_OPTS_ARRAY}"
+  { "$MAKE" "${!PACKAGE_MAKE_OPTS_ARRAY}" $MAKE_OPTS ${!PACKAGE_MAKE_OPTS}
   } >&4 2>&1
 }
 
@@ -869,7 +887,7 @@ build_package_jython() {
 fix_jython_shebangs() {
   # Workaround for Jython 2.7+ (#458)
   for file in "${PREFIX_PATH}/bin"/*; do
-    case "$(head -1 "${file}")" in
+    case "$(head -n1 "${file}")" in
     "#!"*"/bin/jython" )
       sed -i.bak "1 s:.*:#\!${PREFIX_PATH}\/bin\/jython:" "${file}"
       ;;
@@ -921,7 +939,13 @@ build_package_ironpython_builder() {
   ( cd "Stage/Release/IronPython-"* && build_package_ironpython )
 }
 
+build_package_micropython_1_9() {
+  # supported version 1.9.3 and 1.9.4
+  build_package_micropython "with_axtls"
+}
+
 build_package_micropython() {
+  # supported version 1.10 and higher
   if [ "${MAKEOPTS+defined}" ]; then
     MAKE_OPTS="$MAKEOPTS"
   elif [ -z "${MAKE_OPTS+defined}" ]; then
@@ -930,7 +954,7 @@ build_package_micropython() {
   { cd mpy-cross
     "$MAKE" $MAKE_OPTS
     cd ../ports/unix
-    "$MAKE" $MAKE_OPTS axtls
+    [ "$1" = "with_axtls" ] && "$MAKE" $MAKE_OPTS axtls
     "$MAKE" $MAKE_OPTS CFLAGS_EXTRA="-DMICROPY_PY_SYS_PATH_DEFAULT='\".frozen:${PREFIX_PATH}/lib/micropython\"' $CFLAGS_EXTRA"
     "$MAKE" install $MAKE_INSTALL_OPTS PREFIX="${PREFIX_PATH}"
     ln -fs micropython "${PREFIX_PATH}/bin/python"
@@ -1146,7 +1170,7 @@ fix_directory_permissions() {
 }
 
 require_java7() {
-  local version="$(java -version 2>&1 | grep '\(java\|openjdk\) version' | head -1)"
+  local version="$(java -version 2>&1 | grep '\(java\|openjdk\) version' | head -n1)"
   if [[ $version != *[789]* ]]; then
     colorize 1 "ERROR" >&3
     echo ": Java 7 required. Please install a 1.7-compatible JRE." >&3
@@ -1201,7 +1225,7 @@ require_gcc() {
 
   export CC="$gcc"
   if is_mac -ge 1010; then
-    export MACOSX_DEPLOYMENT_TARGET=10.9
+    export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-10.9}
   fi
 }
 
@@ -1379,6 +1403,19 @@ configured_with_package_dir() {
   return 1
 }
 
+# `python-config` ignores LDFLAGS envvar. Adding to LIBS is the only way to add extra stuff
+# to `python-config --ldflags` output
+append_ldflags_libs() {
+  local args="$1"
+  export LDFLAGS="${LDFLAGS:+$LDFLAGS }$args"
+  export LIBS="${LIBS:+${LIBS% } }$args"
+}
+prepend_ldflags_libs() {
+  local args="$1"
+  export LDFLAGS="$args${LDFLAGS:+ $LDFLAGS}"
+  export LIBS="$args${LIBS:+ $LIBS}"
+}
+
 use_homebrew() {
   can_use_homebrew || return 1
   # unless Homebrew is at the default /usr/local, need to add its paths to
@@ -1387,11 +1424,8 @@ use_homebrew() {
     local brew_prefix="$(brew --prefix 2>/dev/null || true)"
     # /usr/local/lib:/usr/lib is the default library search path
     if [[ -n $brew_prefix && $brew_prefix != "/usr" && $brew_prefix != "/usr/local" ]]; then
-      export CPPFLAGS="${CPPFLAGS:+${CPPFLAGS% } }-I${brew_prefix}/include"
-      export LDFLAGS="${LDFLAGS:+${LDFLAGS% } }-L${brew_prefix}/lib -Wl,-rpath,${brew_prefix}/lib"
-      # `python-config` ignores LDFLAGS envvar. Adding to LIBS is the only way to add extra stuff
-      # to `python-config --ldflags` output
-      export LIBS="${LIBS:+${LIBS% } }-L${brew_prefix}/lib -Wl,-rpath,${brew_prefix}/lib"
+      export CPPFLAGS="${CPPFLAGS:+$CPPFLAGS }-I${brew_prefix}/include"
+      append_ldflags_libs "-L${brew_prefix}/lib -Wl,-rpath,${brew_prefix}/lib"
     fi
   fi
 }
@@ -1406,8 +1440,8 @@ use_homebrew_yaml() {
   local libdir="$(brew --prefix libyaml 2>/dev/null || true)"
   if [ -d "$libdir" ]; then
     echo "python-build: use libyaml from homebrew"
-    export CPPFLAGS="-I$libdir/include ${CPPFLAGS}"
-    export LDFLAGS="-L$libdir/lib ${LDFLAGS}"
+    export CPPFLAGS="-I$libdir/include${CPPFLAGS:+ $CPPFLAGS}"
+    export LDFLAGS="-L$libdir/lib${LDFLAGS:+ ${LDFLAGS% }}"
   else
     return 1
   fi
@@ -1417,21 +1451,27 @@ use_freebsd_pkg() {
   # check if FreeBSD
   if [ "FreeBSD" = "$(uname -s)" ]; then
     # use openssl if installed from Ports Collection
-    if [ -f /usr/local/include/openssl/ssl.h ]; then
-      package_option ruby configure --with-openssl-dir="/usr/local"
+    if pkg info -e openssl; then
+      package_option python configure --with-openssl="/usr/local"
     fi
 
     # check if 11-R or later
     release="$(uname -r)"
     if [ "${release%%.*}" -ge 11 ]; then
-      # prefers readline to compile most of ruby versions
-      if pkg info -e readline > /dev/null; then
-        # use readline from Ports Collection
-        package_option ruby configure --with-readline-dir="/usr/local"
-      elif pkg info -e libedit > /dev/null; then
-        # use libedit from Ports Collection
-        package_option ruby configure --enable-libedit
-        package_option ruby configure --with-libedit-dir="/usr/local"
+      # Use packages from Ports Collection.
+      #
+      # Unlike Linux, BSD's cc does not look in /usr/local by default
+      # where Ports-installed packages are, but they are available via pkg-config.
+      # Surprisingly, CPython's Configure only uses pkg-config
+      # to locate some of the dependencies and not others.
+      # Here we detect those that are (as of this writing) known
+      # to not be searched via pkg-config.
+      #
+      # XXX: As a side effect, this would pick up any other libs from Ports
+      # that are searched via compiler
+      if pkg info -e readline || pkg info -e sqlite3; then
+        export CPPFLAGS="${CPPFLAGS:+$CPPFLAGS }-I/usr/local/include"
+        export LDFLAGS="${LDFLAGS:+$LDFLAGS }-L/usr/local/lib -Wl,-rpath,/usr/local/lib"
       fi
     fi
   fi
@@ -1451,11 +1491,23 @@ use_homebrew_readline() {
     local libdir="$(brew --prefix readline 2>/dev/null || true)"
     if [ -d "$libdir" ]; then
       echo "python-build: use readline from homebrew"
-      export CPPFLAGS="-I$libdir/include ${CPPFLAGS}"
-      export LDFLAGS="-L$libdir/lib ${LDFLAGS}"
+      export CPPFLAGS="-I$libdir/include${CPPFLAGS:+ $CPPFLAGS}"
+      export LDFLAGS="-L$libdir/lib${LDFLAGS:+ $LDFLAGS}"
     else
       return 1
     fi
+  fi
+}
+
+use_homebrew_ncurses() {
+  can_use_homebrew || return 1
+  local libdir="$(brew --prefix ncurses 2>/dev/null || true)"
+  if [ -d "$libdir" ]; then
+    echo "python-build: use ncurses from homebrew"
+    export CPPFLAGS="-I$libdir/include${CPPFLAGS:+ $CPPFLAGS}"
+    export LDFLAGS="-L$libdir/lib${LDFLAGS:+ $LDFLAGS}"
+  else
+    return 1
   fi
 }
 
@@ -1465,13 +1517,19 @@ prefer_openssl11() {
   export PYTHON_BUILD_HOMEBREW_OPENSSL_FORMULA
 }
 
+prefer_openssl3() {
+  # Allow overriding the preference of OpenSSL version per definition basis (#1302, #1325, #1326)
+  PYTHON_BUILD_HOMEBREW_OPENSSL_FORMULA="${PYTHON_BUILD_HOMEBREW_OPENSSL_FORMULA:-openssl@3 openssl@1.1 openssl}"
+  export PYTHON_BUILD_HOMEBREW_OPENSSL_FORMULA
+}
+
 build_package_mac_readline() {
   # Install to a subdirectory since we don't want shims for bin/readline.
   READLINE_PREFIX_PATH="${PREFIX_PATH}/readline"
 
   # Tell Python to use this readline for its extension.
-  export CPPFLAGS="-I${READLINE_PREFIX_PATH}/include ${CPPFLAGS}"
-  export LDFLAGS="-L${READLINE_PREFIX_PATH}/lib ${LDFLAGS}"
+  export CPPFLAGS="-I${READLINE_PREFIX_PATH}/include${CPPFLAGS:+ $CPPFLAGS}"
+  export LDFLAGS="-L${READLINE_PREFIX_PATH}/lib${LDFLAGS:+ $LDFLAGS}"
 
   # Make sure pkg-config finds our build first.
   export PKG_CONFIG_PATH="${READLINE_PREFIX_PATH}/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
@@ -1498,8 +1556,8 @@ use_homebrew_openssl() {
         # https://bugs.python.org/issue21541
         package_option python configure --with-openssl="${ssldir}"
       else
-        export CPPFLAGS="-I$ssldir/include ${CPPFLAGS}"
-        export LDFLAGS="-L$ssldir/lib ${LDFLAGS}"
+        export CPPFLAGS="-I$ssldir/include ${CPPFLAGS:+ $CPPFLAGS}"
+        export LDFLAGS="-L$ssldir/lib${LDFLAGS:+ $LDFLAGS}"
       fi
       export PKG_CONFIG_PATH="$ssldir/lib/pkgconfig/:${PKG_CONFIG_PATH}"
       return
@@ -1521,8 +1579,8 @@ build_package_mac_openssl() {
     # https://bugs.python.org/issue21541
     package_option python configure --with-openssl="${OPENSSL_PREFIX_PATH}"
   else
-    export CPPFLAGS="-I${OPENSSL_PREFIX_PATH}/include ${CPPFLAGS}"
-    export LDFLAGS="-L${OPENSSL_PREFIX_PATH}/lib ${LDFLAGS}"
+    export CPPFLAGS="-I${OPENSSL_PREFIX_PATH}/include ${CPPFLAGS:+ $CPPFLAGS}"
+    export LDFLAGS="-L${OPENSSL_PREFIX_PATH}/lib${LDFLAGS:+ $LDFLAGS}"
   fi
 
   # Make sure pkg-config finds our build first.
@@ -1583,7 +1641,7 @@ build_package_verify_openssl() {
       RbConfig::CONFIG.fetch("configure_args").shellsplit.each { |arg| $stderr.puts "  #{arg}" }
       exit 1
     end
-  ' "$(basename "$(type -P yum apt-get | head -1)")" >&4 2>&1
+  ' "$(basename "$(type -P yum apt-get | head -n1)")" >&4 2>&1
 }
 
 use_homebrew_zlib() {
@@ -1601,9 +1659,12 @@ use_xcode_sdk_zlib() {
   local xc_sdk_path="$(xcrun --show-sdk-path 2>/dev/null || true)"
   if [ -d "$xc_sdk_path" ]; then
     echo "python-build: use zlib from xcode sdk"
-    export CFLAGS="-I${xc_sdk_path}/usr/include ${CFLAGS}"
+    # Even though SDK's compiler uses the SDK dirs implicitly,
+    # CPython's setup.py has to have nonstandard paths specified explicitly
+    # to search for zlib.h in them
+    export CPPFLAGS="${CPPFLAGS:+$CPPFLAGS }-I${xc_sdk_path}/usr/include"
     if is_mac -ge 1100; then
-      export LDFLAGS="${LDFLAGS} -L${xc_sdk_path}/usr/lib"
+      export LDFLAGS="${LDFLAGS:+$LDFLAGS }-L${xc_sdk_path}/usr/lib"
     fi
   fi
 }
@@ -1617,7 +1678,15 @@ use_homebrew_tcltk() {
     if [[ -z "$PYTHON_BUILD_TCLTK_USE_PKGCONFIG" ]]; then
       local tcltk_version="$(sh -c '. '"$tcltk_libdir"'/lib/tclConfig.sh; echo $TCL_VERSION')"
       package_option python configure --with-tcltk-libs="-L$tcltk_libdir/lib -ltcl$tcltk_version -ltk$tcltk_version"
-      package_option python configure --with-tcltk-includes="-I$tcltk_libdir/include"
+      # In Homebrew Tcl/Tk 8.6.13, headers have been moved to the 'tcl-tk' subdir.
+      # We're not using tclConfig.sh here 'cuz it produces the version-specific path to <brew prefix>/Cellar
+      # and we'd rather have rpath set to <brew prefix>/opt/<...> to allow micro release upgrades without rebuilding
+      # XXX: do use tclConfig.sh and translate the paths if more path shenanigans appear in later releases
+      if [ -d "$tcltk_libdir/include/tcl-tk" ]; then
+        package_option python configure --with-tcltk-includes="-I$tcltk_libdir/include/tcl-tk"
+      else
+        package_option python configure --with-tcltk-includes="-I$tcltk_libdir/include"
+      fi
     fi
     export PKG_CONFIG_PATH="${tcltk_libdir}/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
   fi
@@ -1694,6 +1763,12 @@ use_dsymutil() {
   fi
 }
 
+use_free_threading() {
+  if [[ -n "$PYTHON_BUILD_FREE_THREADING" ]]; then
+    package_option python configure --disable-gil
+  fi
+}
+
 build_package_enable_shared() {
     package_option python configure --enable-shared
 }
@@ -1702,7 +1777,7 @@ build_package_auto_tcltk() {
   if is_mac && [ ! -d /usr/include/X11 ]; then
     if [ -d /opt/X11/include ]; then
       if [[ "$CPPFLAGS" != *-I/opt/X11/include* ]]; then
-        export CPPFLAGS="-I/opt/X11/include $CPPFLAGS"
+        export CPPFLAGS="-I/opt/X11/include${CPPFLAGS:+ $CPPFLAGS}"
       fi
     else
       package_option python configure --without-tk
@@ -1710,20 +1785,14 @@ build_package_auto_tcltk() {
   fi
 }
 
-# extglob must be set at both parse time and runtime
-# https://stackoverflow.com/questions/49283740/bash-script-throws-syntax-errors-when-the-extglob-option-is-set-inside-a-subsh
-shopt -s extglob
 package_is_python() {
-  shopt -s extglob
   case "$1" in
     Python-* | jython-* | pypy-* | pypy[0-9].+([0-9])-* | stackless-* )
       return 0
       ;;
   esac
   return 1
-  shopt -u extglob
 }
-shopt -u extglob
 
 apply_patch() {
   local package_name="$1"
@@ -1738,9 +1807,9 @@ apply_patch() {
 
 
 build_package_symlink_version_suffix() {
-  if [[ "$CONFIGURE_OPTS $PYTHON_CONFIGURE_OPTS" == *"--enable-framework"* ]]; then
+  if [[ "${PYTHON_CONFIGURE_OPTS_ARRAY[*]} $CONFIGURE_OPTS $PYTHON_CONFIGURE_OPTS" == *"--enable-framework"* ]]; then
     if [ -e "${PREFIX_PATH}/bin" ]; then
-      # Always create `bin` as symlink to framework path if the version was built with `--enable-frameowrk` (#590)
+      # Always create `bin` as symlink to framework path if the version was built with `--enable-framework` (#590)
       rm -rf "${PREFIX_PATH}/bin.orig"
       mv -f "${PREFIX_PATH}/bin" "${PREFIX_PATH}/bin.orig"
     fi
@@ -1794,7 +1863,7 @@ verify_python() {
 }
 
 try_python_module() {
-  if ! "$PYTHON_BIN" -c "import $1" 1>/dev/null 2>&1; then
+  if ! "$PYTHON_BIN" -c "import $1"; then
     { colorize 1 "WARNING"
       echo ": The Python $1 extension was not compiled${3:+ $3}. Missing the ${2:-$1}?"
       return 0
@@ -1803,7 +1872,7 @@ try_python_module() {
 }
 
 verify_python_module() {
-  if ! "$PYTHON_BIN" -c "import $1" 1>/dev/null 2>&1; then
+  if ! "$PYTHON_BIN" -c "import $1"; then
     { colorize 1 "ERROR"
       echo ": The Python $1 extension was not compiled. Missing the ${2:-$1}?"
       echo
@@ -1949,6 +2018,16 @@ build_package_verify_py312() {
   build_package_verify_py311 "$1" "${2:-3.12}"
 }
 
+# Post-install check for Python 3.13.x
+build_package_verify_py313() {
+  build_package_verify_py312 "$1" "${2:-3.13}"
+}
+
+# Post-install check for Python 3.14.x
+build_package_verify_py314() {
+  build_package_verify_py313 "$1" "${2:-3.13}"
+}
+
 # Post-install check for Python 3.x rolling release scripts
 # XXX: Will need splitting into project-specific ones if there emerge
 # multiple rolling-release scripts with different checks needed
@@ -2004,14 +2083,23 @@ build_package_get_pip() {
   build_package_symlink_version_suffix
 }
 
+# Pip <21 (in 2.7 and derivatives like PyPy-2.7) doesn't support -I
+build_package_ensurepip_lt21() {
+  build_package_ensurepip lt21
+}
+
 build_package_ensurepip() {
+  local mode="$1"
   local ensurepip_opts
   # Install as `--altinstall` if the Python is installed as `altinstall` (#255)
   if [[ "$PYTHON_MAKE_INSTALL_TARGET" == *"altinstall"* ]]; then
     ensurepip_opts="--altinstall"
   fi
+  local python_opts="-I"
+  if [[ $mode == "lt21" ]]; then python_opts="-s"; fi
+  
   # FIXME: `--altinstall` with `get-pip.py`
-  "$PYTHON_BIN" -s -m ensurepip ${ensurepip_opts} 1>/dev/null 2>&1 || build_package_get_pip "$@" || return 1
+  "$PYTHON_BIN" $python_opts -m ensurepip ${ensurepip_opts} 1>/dev/null 2>&1 || build_package_get_pip "$@" || return 1
   build_package_symlink_version_suffix
 }
 
@@ -2194,26 +2282,30 @@ if [ -n "$DEBUG" ]; then
   package_option python configure --with-pydebug
 fi
 
+if [[ "$CONFIGURE_OPTS $PYTHON_CONFIGURE_OPTS" != *"--enable-framework"* && "$CONFIGURE_OPTS $PYTHON_CONFIGURE_OPTS" != *"--disable-shared"* ]]; then
+  package_option python configure --enable-shared
+fi
+
 # python-build: Specify `--libdir` on configure to fix build on openSUSE (#36)
 package_option python configure --libdir="${PREFIX_PATH}/lib"
 
 # python-build: Set `RPATH` if `--enable-shared` was given (#65, #66, #82)
-if [[ "$CONFIGURE_OPTS $PYTHON_CONFIGURE_OPTS" == *"--enable-shared"* ]]; then
+if [[ "$CONFIGURE_OPTS $PYTHON_CONFIGURE_OPTS ${PYTHON_CONFIGURE_OPTS_ARRAY[@]}" == *"--enable-shared"* ]]; then
   # The ld on Darwin embeds the full paths to each dylib by default
-  if [[ "$LDFLAGS" != *"-rpath="* ]] && ! is_mac; then
-    export LDFLAGS="-Wl,-rpath=${PREFIX_PATH}/lib ${LDFLAGS}"
+  if [[ "$LDFLAGS" != *"-rpath="* ]] ; then
+    prepend_ldflags_libs "-Wl,-rpath,${PREFIX_PATH}/lib"
   fi
 fi
 
 # python-build: Set `RPATH` if --shared` was given for PyPy (#244)
 if [[ "$PYPY_OPTS" == *"--shared"* ]]; then
-  export LDFLAGS="-Wl,-rpath=${PREFIX_PATH}/lib ${LDFLAGS}"
+  prepend_ldflags_libs "-Wl,-rpath=${PREFIX_PATH}/lib"
 fi
 
 # Add support for framework installation (`--enable-framework`) of CPython (#55, #99)
 if [[ "$CONFIGURE_OPTS $PYTHON_CONFIGURE_OPTS" == *"--enable-framework"* ]]; then
   if ! is_mac; then
-    echo "python-build: framework installation is not supported." >&2
+    echo "python-build: framework installation is not supported outside of MacOS." >&2
     exit 1
   fi
   create_framework_dirs() {
@@ -2229,15 +2321,27 @@ if [[ "$CONFIGURE_OPTS $PYTHON_CONFIGURE_OPTS" == *"--enable-framework"* ]]; the
   create_framework_dirs "${DEFINITION_PATH##*/}"
   # the `/Library/Frameworks` suffix makes CPython build install apps under prefix rather than into /Applications (#1003)
   package_option python configure --enable-framework="${PREFIX_PATH}/Library/Frameworks"
+  
+  #FIXME: doesn't properly handle paths with spaces. Fix by parsing *OPTS into arrays.
+  CONFIGURE_OPTS="${CONFIGURE_OPTS//--enable-framework?(=*([^ ]))?( )/}";
+  CONFIGURE_OPTS="${CONFIGURE_OPTS% }"
+  PYTHON_CONFIGURE_OPTS="${PYTHON_CONFIGURE_OPTS//--enable-framework?(=*([^ ]))?( )/}";
+  PYTHON_CONFIGURE_OPTS="${PYTHON_CONFIGURE_OPTS% }"
 fi
 
 # Build against universal SDK
 if [[ "$CONFIGURE_OPTS $PYTHON_CONFIGURE_OPTS" == *"--enable-universalsdk"* ]]; then
   if ! is_mac; then
-    echo "python-build: universal installation is not supported." >&2
+    echo "python-build: universal installation is not supported outside of MacOS." >&2
     exit 1
   fi
   package_option python configure --enable-universalsdk=/
+  #FIXME: doesn't properly handle paths with spaces. Fix by parsing *OPTS into arrays.
+  CONFIGURE_OPTS="${CONFIGURE_OPTS//--enable-universalsdk?(=*([^ ]))?( )/}"
+  CONFIGURE_OPTS="${CONFIGURE_OPTS% }"
+  PYTHON_CONFIGURE_OPTS="${PYTHON_CONFIGURE_OPTS//--enable-universalsdk?(=*([^ ]))?( )/}"
+  PYTHON_CONFIGURE_OPTS="${PYTHON_CONFIGURE_OPTS% }"
+
   if [[ "$CONFIGURE_OPTS $PYTHON_CONFIGURE_OPTS" != *"--with-universal-archs"* ]]; then
     # in CPython's configure.ac, --with-universal-archs defaults to 'intel' which means i386 + x86_64
     # since 2.7.5 and 3.3.0 -- i.e. in all non-EOL versions
@@ -2297,7 +2401,7 @@ if [ -z "${GET_PIP_URL}" ]; then
     2.6 | 2.6.* )
       GET_PIP_URL="https://bootstrap.pypa.io/pip/2.6/get-pip.py"
       ;;
-    2.7 | 2.7.* )
+    2.7 | 2.7.* | pypy2.7 | pypy2.7-* )
       GET_PIP_URL="https://bootstrap.pypa.io/pip/2.7/get-pip.py"
       ;;
     3.2 | 3.2.* )
@@ -2309,10 +2413,10 @@ if [ -z "${GET_PIP_URL}" ]; then
     3.4 | 3.4.* )
       GET_PIP_URL="https://bootstrap.pypa.io/pip/3.4/get-pip.py"
       ;;
-    3.5 | 3.5.* )
+    3.5 | 3.5.* | pypy3.5 | pypy3.5-* )
       GET_PIP_URL="https://bootstrap.pypa.io/pip/3.5/get-pip.py"
       ;;
-    3.6 | 3.6.* )
+    3.6 | 3.6.* | pypy3.6 | pypy3.6-* )
       GET_PIP_URL="https://bootstrap.pypa.io/pip/3.6/get-pip.py"
       ;;
     * )
@@ -2341,6 +2445,7 @@ python_bin_suffix() {
     version_name="${version_name%-dev}"
     version_name="${version_name%-rc*}"
     version_name="${version_name%rc*}"
+    version_name="${version_name%%*([^0-9])}"
     version_info=(${version_name//./ })
     echo "${version_info[0]}.${version_info[1]}"
     ;;
@@ -2373,8 +2478,8 @@ if [ -n "$VERBOSE" ]; then
   trap "kill $TAIL_PID" SIGINT SIGTERM EXIT
 fi
 
-export LDFLAGS="-L${PREFIX_PATH}/lib ${LDFLAGS}"
-export CPPFLAGS="-I${PREFIX_PATH}/include ${CPPFLAGS}"
+prepend_ldflags_libs "-L${PREFIX_PATH}/lib"
+export CPPFLAGS="-I${PREFIX_PATH}/include${CPPFLAGS:+ $CPPFLAGS}"
 
 unset PYTHONHOME
 unset PYTHONPATH

@@ -83,7 +83,7 @@ function main() {
     exit 0
     ;;
   "detect-shell")
-    detect_profile
+    detect_profile 1
     print_detect_shell
     exit 0
     ;;
@@ -93,6 +93,8 @@ function main() {
 }
 
 function detect_profile() {
+  local detect_for_detect_shell="$1"
+
   case "$shell" in
   bash )
     if [ -e '~/.bash_profile' ]; then
@@ -107,13 +109,23 @@ function detect_profile() {
     profile='~/.zprofile'
     rc='~/.zshrc'
     ;;
-  ksh )
+  ksh | ksh93 | mksh )
+    # There are two implementations of Korn shell: AT&T (ksh93) and Mir (mksh).
+    # Systems may have them installed under those names, or as ksh, so those
+    # are recognized here. The obsolete ksh88 (subsumed by ksh93) and pdksh
+    # (subsumed by mksh) are not included, since they are unlikely to still
+    # be in use as interactive shells anywhere.
     profile='~/.profile'
     rc='~/.profile'
     ;;
   * )
-    profile='your shell'\''s login startup file'
-    rc='your shell'\''s interactive startup file'
+    if [ -n "$detect_for_detect_shell" ]; then
+      profile=
+      rc=
+    else
+      profile='your shell'\''s login startup file'
+      rc='your shell'\''s interactive startup file'
+    fi
     ;;
   esac
 }
@@ -148,12 +160,12 @@ function help_() {
         echo "$profile :"
       else
         echo
-        echo "${profile_explain:-$profile} (for login shells)"
-        echo "and $rc (for interactive shells) :"
+        echo "# ${profile_explain:-$profile} (for login shells)"
+        echo "# and $rc (for interactive shells) :"
       fi
       echo
       echo 'export PYENV_ROOT="$HOME/.pyenv"'
-      echo 'command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"'
+      echo '[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"'
       echo 'eval "$(pyenv init -)"'
       ;;
     esac
@@ -262,7 +274,7 @@ function pyenv
 end
 EOS
     ;;
-  ksh )
+  ksh | ksh93 | mksh )
     cat <<EOS
 function pyenv {
   typeset command
@@ -285,7 +297,7 @@ EOS
   fi
 
   case "\$command" in
-  ${commands[*]})
+  ${commands[*]:-/})
     eval "\$(pyenv "sh-\$command" "\$@")"
     ;;
   *)
